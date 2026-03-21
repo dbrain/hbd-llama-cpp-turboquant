@@ -621,6 +621,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
+        fprintf(stderr, "[MTP-VERIFY] pos=%d: sampled=%d, draft=%d, %s\n",
+                idxs[i], id, draft[i], (draft[i] == id) ? "ACCEPTED" : "REJECTED");
+        fflush(stderr);
+
         if (draft[i] != id) {
             break;
         }
@@ -632,6 +636,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+
+        fprintf(stderr, "[MTP-VERIFY] bonus pos=%d: sampled=%d\n", idxs[i], id);
+        fflush(stderr);
     }
 
     return result;

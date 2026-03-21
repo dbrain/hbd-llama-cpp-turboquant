@@ -176,6 +176,15 @@ struct server_slot {
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
+    // Inline MTP (Multi-Token Prediction) state.
+    // Instead of using the speculative framework (which has M-RoPE and SSM
+    // rollback issues), we propose one draft token from MTP logits and verify
+    // it in the next decode step. No seq_rm or rollback needed.
+    llama_token  mtp_draft_token = -1;  // proposed draft token (-1 = none)
+    int          mtp_i_batch     = -1;  // batch index of the draft token
+    bool         mtp_pending     = false; // true when draft is in the batch awaiting verification
+    bool         mtp_cooldown    = false; // skip MTP proposal for one iteration after draft processing
+
     // stats
     size_t n_sent_text = 0; // number of sent text character
 
@@ -2914,7 +2923,6 @@ private:
 
                 common_sampler_accept(slot.smpl.get(), id, true);
 
-                // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
 
                 slot.n_decoded += 1;
@@ -2937,7 +2945,6 @@ private:
                 }
 
                 if (!process_token(result, slot)) {
-                    // release slot because of stop condition
                     slot.print_timings();
                     send_final_response(slot);
                     metrics.on_prediction(slot);
