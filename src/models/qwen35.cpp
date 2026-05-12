@@ -97,8 +97,10 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
 
     ggml_build_forward_expand(gf, cur);
 
-    // Build MTP head if nextn_predict_layers > 0
-    if (hparams.nextn_predict_layers > 0) {
+    // Gate on mtp_enabled, not just the model arch: building this head unconditionally
+    // costs ~13% decode tok/s and ~600 MiB compute-buffer scratch even when --spec-type
+    // mtp is off (lm_head matmul + norms run every step and t_logits_mtp is discarded).
+    if (hparams.nextn_predict_layers > 0 && cparams.mtp_enabled) {
         build_mtp_head(inp, inp_pos, sections);
     }
 }

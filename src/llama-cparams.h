@@ -35,6 +35,7 @@ struct llama_cparams {
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
     bool gdn_state_f16;      // store GDN recurrent state buffer as F16 (half VRAM + halves load/writeback bandwidth)
+    bool mtp_enabled;        // build the MTP head when the model has nextn_predict_layers > 0 (set by spec-decode caller)
     bool no_perf;
     bool warmup;
     bool op_offload;

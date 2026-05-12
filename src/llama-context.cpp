@@ -165,6 +165,11 @@ llama_context::llama_context(
         }
     }
 
+    cparams.mtp_enabled = params.mtp_enabled;
+    if (cparams.mtp_enabled) {
+        LLAMA_LOG_INFO("%s: MTP head = enabled\n", __func__);
+    }
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -2949,6 +2954,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.mtp_enabled                 =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };
