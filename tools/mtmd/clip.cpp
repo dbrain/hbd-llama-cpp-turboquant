@@ -668,6 +668,22 @@ ggml_tensor * clip_graph::build_attn(
     if (flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
         ggml_tensor * v = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
 
+        // ggml-cuda MMA F16 has no D=72 config (sm_86 mma m16n8k16 wants
+        // D % 16 == 0) so d_head=72 falls through to the TILE kernel without
+        // tensor cores. Zero-pad Q/K/V head_dim 72 -> 80, then slice output
+        // back. Zero padding preserves Q·K^T (zeros contribute 0) and yields
+        // zeros in padded V channels, which we discard.
+        const int d_head_orig = q->ne[0];
+        int d_pad = 0;
+        if (d_head_orig == 72) {
+            d_pad = 8;
+        }
+        if (d_pad > 0) {
+            q = ggml_pad(ctx0, q, d_pad, 0, 0, 0);
+            k = ggml_pad(ctx0, k, d_pad, 0, 0, 0);
+            v = ggml_pad(ctx0, v, d_pad, 0, 0, 0);
+        }
+
         k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         if (kq_mask) {
@@ -678,6 +694,13 @@ ggml_tensor * clip_graph::build_attn(
         ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
         if (sinks != nullptr) {
             ggml_flash_attn_ext_add_sinks(cur, sinks);
+        }
+
+        if (d_pad > 0) {
+            cur = ggml_view_4d(ctx0, cur,
+                               d_head_orig, cur->ne[1], cur->ne[2], cur->ne[3],
+                               cur->nb[1], cur->nb[2], cur->nb[3], 0);
+            cur = ggml_cont(ctx0, cur);
         }
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
