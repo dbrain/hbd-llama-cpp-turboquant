@@ -100,7 +100,16 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     // Gate on mtp_enabled, not just the model arch: building this head unconditionally
     // costs ~13% decode tok/s and ~600 MiB compute-buffer scratch even when --spec-type
     // mtp is off (lm_head matmul + norms run every step and t_logits_mtp is discarded).
-    if (hparams.nextn_predict_layers > 0 && cparams.mtp_enabled) {
+    //
+    // Lap-9.5: also gate on n_tokens — MTP only runs at spec verify (batch=1-2). At
+    // prefill (n_tokens up to n_ubatch=512), MTP scratch grows linearly in batch, but
+    // the head's output (draft logits) is unused — only the LAST position's draft is
+    // sampled, and the sampler invokes MTP at small-batch decode anyway. Skipping
+    // prefill saves ~597 MiB compute buffer (1098 → ~501 MiB worst case @ bs=512).
+    // The trade-off: MTP's own KV cache won't be populated for prompt positions, so
+    // first-step drafts condition only on recent decode context. Empirically tested
+    // for accept-rate impact across short/long prompts and temp=0/0.7/0.9.
+    if (hparams.nextn_predict_layers > 0 && cparams.mtp_enabled && n_tokens <= 8) {
         build_mtp_head(inp, inp_pos, sections);
     }
 }
