@@ -171,11 +171,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 // since both tokens are processed atomically.
                 int32_t best_cell = -1;
                 llama_pos best_pos = -1;
-                fprintf(stderr, "[MTP-SEQRM] seq_id=%d, p0=%d, p1=%d, tail_pos=%d, searching for checkpoint at pos<=%d\n",
-                        (int)seq_id, (int)p0, (int)p1, (int)cell.pos, (int)(p0-1));
                 for (uint32_t i = 0; i < size; ++i) {
                     if (cells[i].has_seq_id(seq_id)) {
-                        fprintf(stderr, "[MTP-SEQRM]   cell[%d] pos=%d\n", i, (int)cells[i].pos);
                         // Find the closest checkpoint at or below p0-1
                         if (cells[i].pos < p0 && cells[i].pos > best_pos) {
                             best_pos = cells[i].pos;
@@ -183,16 +180,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                         }
                     }
                 }
-                fflush(stderr);
 
                 if (best_cell >= 0) {
-                    fprintf(stderr, "[MTP-SEQRM] FOUND checkpoint at cell[%d] pos=%d (target was %d) — rolling back\n",
-                            best_cell, (int)best_pos, (int)(p0-1));
-                    fflush(stderr);
                     tail_id = best_cell;
                 } else {
-                    fprintf(stderr, "[MTP-SEQRM] NO checkpoint found — seq_rm FAILED\n");
-                    fflush(stderr);
                     return false;
                 }
             }
@@ -439,9 +430,6 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         return;
     }
 
-    fprintf(stderr, "[MTP-COPYCELL] copy_cell(%d -> %d), n_layer=%d\n", i_src, i_dst, (int)hparams.n_layer);
-    fflush(stderr);
-
     // Copy recurrent state via GPU-to-GPU (ggml_backend_tensor_copy).
     // Views created with no_alloc=true have buffer=NULL. We must set
     // the buffer to the parent tensor's buffer for the copy to work.
@@ -574,10 +562,6 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
-
-    fprintf(stderr, "[MTP-FINDSLOT] find_slot: n_seq_tokens=%d, n_seqs=%d, size=%d, used=%d, head=%d\n",
-            (int)n_seq_tokens, (int)n_seqs, (int)size, (int)used, (int)head);
-    fflush(stderr);
 
     // if we have enough unused cells before the current head ->
     //   better to start searching from the beginning of the cache, hoping to fill it
