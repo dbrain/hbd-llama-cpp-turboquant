@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/cuda-op-profile.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -4185,7 +4186,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                bool ok;
+                {
+                    GGML_CUDA_PROFILE_OP_SCOPE(cuda_ctx->stream(), ggml_op_name(node->op), node->name);
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4295,6 +4300,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    // Profile mode: keep CUDA graphs off so per-op cudaEvent timing is real.
+    if (GGML_CUDA_PROFILE_FORCE_NO_CUDA_GRAPH()) {
+        use_cuda_graph = false;
+        cuda_graph_update_required = false;
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4306,6 +4317,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    GGML_CUDA_PROFILE_NOTE_GRAPH_CALL();
+    GGML_CUDA_PROFILE_DUMP_IF_DUE(stderr);
 
     return GGML_STATUS_SUCCESS;
 }
