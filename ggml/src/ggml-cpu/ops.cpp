@@ -10461,12 +10461,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     int64_t ir0,
     int64_t ir1) {
 
-    ggml_tensor * src_q     = dst->src[0];
-    ggml_tensor * src_k     = dst->src[1];
-    ggml_tensor * src_v     = dst->src[2];
-    ggml_tensor * src_g     = dst->src[3];
-    ggml_tensor * src_beta  = dst->src[4];
-    ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_q         = dst->src[0];
+    ggml_tensor * src_k         = dst->src[1];
+    ggml_tensor * src_v         = dst->src[2];
+    ggml_tensor * src_g         = dst->src[3];
+    ggml_tensor * src_beta      = dst->src[4];
+    ggml_tensor * src_state     = dst->src[5];
+    ggml_tensor * src_writeback = dst->src[6]; // optional: write new state here instead of dst+offset
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -10479,6 +10480,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
+    GGML_ASSERT(src_state->type == GGML_TYPE_F32 || src_state->type == GGML_TYPE_F16);
+    if (src_writeback) {
+        GGML_ASSERT(src_writeback->type == GGML_TYPE_F32 || src_writeback->type == GGML_TYPE_F16);
+    }
+    // Legacy concat layout writes new_state into the F32 dst tail — F16 is only meaningful
+    // when there's a dedicated writeback target.
+    GGML_ASSERT(src_writeback != nullptr || src_state->type == GGML_TYPE_F32);
 
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
     GGML_ASSERT(src_beta->ne[0] == 1);
@@ -10493,22 +10501,40 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_TENSOR_LOCALS(size_t,  nbg, src_g, nb);
     GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
 
-    const bool kda = (neg0 == S_v);
+    const bool kda          = (neg0 == S_v);
+    const bool state_in_f16 = (src_state->type == GGML_TYPE_F16);
+    const ggml_type out_t   = src_writeback ? src_writeback->type : GGML_TYPE_F32;
+    const bool state_out_f16 = (out_t == GGML_TYPE_F16);
 
-    // scratch layout per thread: [delta(S_v)]
-    const int64_t scratch_per_thread = S_v;
+    // scratch layout per thread: [delta(S_v) | working_state(S_v*S_v)]
+    // The working_state slab is only required when in/out dtypes differ from F32 in-place
+    // (the kernel mutates s_out across tokens — a mixed-dtype dst would force per-token
+    // up/down casts; far easier to always go through an F32 working slab when either side
+    // is F16). For pure-F32 in/out we fast-path in place inside the dst/writeback buffer.
+    const int64_t scratch_per_thread = S_v + S_v*S_v;
     const int ith = params->ith;
 
-    float * delta = (float *)params->wdata + ith * scratch_per_thread + CACHE_LINE_SIZE_F32;
+    float * scratch    = (float *)params->wdata + ith * scratch_per_thread + CACHE_LINE_SIZE_F32;
+    float * delta      = scratch;
+    float * scratch_ws = scratch + S_v;
 
-    // output layout: [attn_scores | new_states]
-    // attn_scores: S_v * H * n_tokens * n_seqs floats
-    // new_states:  S_v * S_v * H * n_seqs floats
+    // output layout:
+    //   if src_writeback == NULL: dst is concat [attn_scores | new_states] (F32)
+    //     attn_scores: S_v * H * n_tokens * n_seqs floats
+    //     new_states:  S_v * S_v * H * n_seqs floats
+    //   if src_writeback != NULL: dst is attn_scores only; new_states is written to
+    //     src_writeback->data as a side effect (fused path — bypasses trailing CPY).
+    //     dtype follows src_writeback (F32 or F16, may differ from src_state).
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
     float * attn_out_base  = (float *)dst->data;
-    float * state_out_base = (float *)dst->data + attn_score_elems;
 
-    const float * state_in_base = (const float *)src_state->data;
+    const size_t state_in_elem_size  = ggml_type_size(src_state->type);
+    const size_t state_out_elem_size = ggml_type_size(out_t);
+    void * state_out_base = src_writeback
+        ? src_writeback->data
+        : (void *)((char *)dst->data + attn_score_elems * sizeof(float));
+
+    const void * state_in_base = src_state->data;
 
   //const int64_t rq1 = nev1 / neq1;
   //const int64_t rk1 = nev1 / nek1;
@@ -10527,11 +10553,27 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        float * s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        const int64_t s_offset_elems = (iv3 * H + iv1) * S_v * S_v;
+        void * s_out_storage = (void *)((char *)state_out_base + s_offset_elems * state_out_elem_size);
 
-        // copy input state into output buffer and operate in-place
-        const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        // working state slab — F32 for the inner loop. Fast path is pure-F32 in/out (operate
+        // in place inside the dst/writeback buffer). Anything else routes through the
+        // per-thread scratch slab with conversion on entry/exit.
+        float * s_out;
+        const bool inplace = !state_in_f16 && !state_out_f16;
+        if (inplace) {
+            s_out = (float *)s_out_storage;
+            const float * s_in = (const float *)state_in_base + s_offset_elems;
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        } else {
+            s_out = scratch_ws;
+            if (state_in_f16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *)state_in_base + s_offset_elems, s_out, S_v * S_v);
+            } else {
+                const float * s_in = (const float *)state_in_base + (size_t)s_offset_elems;
+                memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+            }
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -10580,6 +10622,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             }
 
             attn_data += S_v * H; // advance to next token
+        }
+
+        // commit working state back to storage when not on the in-place fast path.
+        if (!inplace) {
+            if (state_out_f16) {
+                ggml_fp32_to_fp16_row(s_out, (ggml_fp16_t *)s_out_storage, S_v * S_v);
+            } else {
+                memcpy(s_out_storage, s_out, S_v * S_v * sizeof(float));
+            }
         }
     }
 }

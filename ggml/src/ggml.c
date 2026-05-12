@@ -3886,12 +3886,32 @@ struct ggml_tensor * ggml_get_rows(
     GGML_ASSERT(b->ne[3] == 1);
     GGML_ASSERT(b->type == GGML_TYPE_I32);
 
-    // TODO: implement non F32 return
+    // Default get_rows promotes to F32 for legacy callers. For an explicit-dtype gather
+    // (e.g. keeping an F16 source buffer as F16), use ggml_get_rows_typed.
     enum ggml_type type = GGML_TYPE_F32;
     if (a->type == GGML_TYPE_I32) {
         type = a->type;
     }
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
+
+    result->op     = GGML_OP_GET_ROWS;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_get_rows_typed(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        enum   ggml_type      dst_type) {
+    GGML_ASSERT(a->ne[2] == b->ne[1]);
+    GGML_ASSERT(a->ne[3] == b->ne[2]);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, dst_type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
 
     result->op     = GGML_OP_GET_ROWS;
     result->src[0] = a;
@@ -6213,7 +6233,8 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * v,
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
-        struct ggml_tensor  * state) {
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * writeback) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6226,7 +6247,9 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(v->type == GGML_TYPE_F32);
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
-    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    // Recurrent state may be F32 (default) or F16 (LLAMA_GDN_STATE_F16 — half VRAM + halves the
+    // GET_ROWS load + writeback bandwidth on the fused path).
+    GGML_ASSERT(state->type == GGML_TYPE_F32 || state->type == GGML_TYPE_F16);
 
     const int64_t S_v      = v->ne[0];
     const int64_t H        = v->ne[1];
@@ -6239,9 +6262,26 @@ struct ggml_tensor * ggml_gated_delta_net(
 
     GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
 
-    // concat output and new_state into a single tensor
-    // output: S_v * H * n_tokens * n_seqs, state: S_v * S_v * H * n_seqs
-    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs, 1, 1 };
+    // dst layout:
+    //   if writeback == NULL: legacy concat of [attn_out | new_state]
+    //     attn_out:  S_v * H * n_tokens * n_seqs
+    //     new_state: S_v * S_v * H * n_seqs
+    //   if writeback != NULL: attn_out only; new_state is written to writeback as a side effect
+    int64_t ne[4];
+    ne[0] = S_v * H;
+    ne[1] = writeback ? n_tokens * n_seqs : n_tokens * n_seqs + S_v * n_seqs;
+    ne[2] = 1;
+    ne[3] = 1;
+
+    if (writeback) {
+        // Writeback target is the persistent state slot. F32 is always supported. F16 is
+        // accepted so the GDN kernel can write directly into an F16 ssm_states_all buffer
+        // (LLAMA_GDN_STATE_F16) — `state` itself comes through ggml_get_rows which always
+        // outputs F32, so state.type and writeback.type may legitimately differ here.
+        GGML_ASSERT(writeback->type == GGML_TYPE_F32 || writeback->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_nelements(writeback) >= S_v * S_v * H * n_seqs);
+    }
+
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
@@ -6251,6 +6291,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+    result->src[6] = writeback;
 
     return result;
 }

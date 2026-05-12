@@ -435,18 +435,25 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
+    // Fused state writeback (see qwen35.cpp for explanation).
+    ggml_tensor * state_writeback =
+        ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                     kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+
+    const bool use_fused_gdn = (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
+
+    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state,
+                                     use_fused_gdn ? state_writeback : nullptr,
+                                     il);
 
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
 
-    // Update the recurrent states
-    ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, new_state,
-                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    if (!use_fused_gdn) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state, state_writeback));
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

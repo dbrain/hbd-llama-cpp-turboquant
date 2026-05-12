@@ -46,6 +46,10 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 int           il);
 
     // use the ggml_gated_delta_net fused operator
+    // state_writeback (optional): if non-NULL, the fused op writes the new recurrent
+    // state directly to it, bypassing the trailing ggml_cpy that the caller would
+    // otherwise emit. The returned new_state IS state_writeback. Only honored on the
+    // fused path; ignored by chunking/autoregressive fallbacks.
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_fused(
                 ggml_tensor * q,
                 ggml_tensor * k,
@@ -53,6 +57,7 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
+                ggml_tensor * state_writeback,
                         int   il);
 
     // choose one of two implementations above based on the number of tokens
@@ -63,6 +68,7 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
+                ggml_tensor * state_writeback,
                         int   il);
 };
 

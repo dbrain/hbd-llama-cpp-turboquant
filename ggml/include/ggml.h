@@ -1657,6 +1657,16 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    // ggml_get_rows with an explicit output dtype. Default ggml_get_rows always promotes
+    // to F32. Use this when you want to preserve a source F16/BF16 buffer's dtype across a
+    // gather (e.g. the F16 recurrent-state cache feeding directly into a half-aware kernel).
+    // Backend support: CUDA accepts F32/F16/BF16/I32. CPU is F32-only — fall back if needed.
+    GGML_API struct ggml_tensor * ggml_get_rows_typed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            enum   ggml_type      dst_type);
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
@@ -2536,6 +2546,12 @@ extern "C" {
 
     // TODO: add ggml_gated_delta_net_set_bcast() to be able to configure Q, K broadcast type: tiled vs interleaved [TAG_GGML_GDN_BCAST]
     // ref: https://github.com/ggml-org/llama.cpp/pull/19468#discussion_r2786394306
+    //
+    // writeback (optional): if non-NULL, the new recurrent state is written directly to
+    // writeback->data as a side effect, and dst contains the attention output only
+    // (shape [S_v*H, n_tokens*n_seqs, 1, 1]). If NULL, dst is the legacy
+    // [attn_out | new_state] concatenation. writeback must hold at least
+    // S_v*S_v*H*n_seqs F32 elements contiguous starting at its data pointer.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2543,7 +2559,8 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
-            struct ggml_tensor  * state);
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * writeback);
 
     // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
     // Applies WHT rotation to 128-element groups along ne[0]: sign1 → butterfly → sign2 → normalize

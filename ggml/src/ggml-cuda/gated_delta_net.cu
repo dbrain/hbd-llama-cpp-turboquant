@@ -1,14 +1,40 @@
 #include "gated_delta_net.cuh"
 
-template <int S_v, bool KDA>
+#include <cuda_fp16.h>
+
+// State buffer (curr_state load + state writeback) may be either F32 or F16.
+// Compute always happens in F32 register accumulators; only the global-memory
+// load and store are templated on the storage dtype.
+template <typename T>
+static __device__ __forceinline__ float gdn_state_load(const T * p) {
+    return static_cast<float>(*p);
+}
+
+template <>
+__device__ __forceinline__ float gdn_state_load<half>(const half * p) {
+    return __half2float(*p);
+}
+
+template <typename T>
+static __device__ __forceinline__ void gdn_state_store(T * p, float v) {
+    *p = static_cast<T>(v);
+}
+
+template <>
+__device__ __forceinline__ void gdn_state_store<half>(half * p, float v) {
+    *p = __float2half(v);
+}
+
+template <int S_v, bool KDA, typename ST_IN, typename ST_OUT>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
                                      const float * v,
                                      const float * g,
                                      const float * beta,
-                                     const float * curr_state,
-                                     float *       dst,
+                                     const ST_IN * curr_state,
+                                     float *       attn_data,
+                                     ST_OUT *      state,
                                      int64_t       H,
                                      int64_t       n_tokens,
                                      int64_t       n_seqs,
@@ -33,10 +59,6 @@ gated_delta_net_cuda(const float * q,
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
 
-    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
-    float *       attn_data        = dst;
-    float *       state            = dst + attn_score_elems;
-
     const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
     state += state_offset;
     curr_state += state_offset + col * S_v;
@@ -51,7 +73,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * warp_size + lane;
-        s_shard[r]  = curr_state[i];
+        s_shard[r]  = gdn_state_load<ST_IN>(curr_state + i);
     }
 
     for (int t = 0; t < n_tokens; t++) {
@@ -140,16 +162,16 @@ gated_delta_net_cuda(const float * q,
     // Write state back to global memory (transposed layout)
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
-        const int i          = r * warp_size + lane;
-        state[col * S_v + i] = s_shard[r];
+        const int i = r * warp_size + lane;
+        gdn_state_store<ST_OUT>(state + col * S_v + i, s_shard[r]);
     }
 }
 
-template <bool KDA>
+template <bool KDA, typename ST_IN, typename ST_OUT>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
-        const float * g_d, const float * b_d, const float * s_d,
-        float * dst_d,
+        const float * g_d, const float * b_d, const ST_IN * s_d,
+        float * attn_d, ST_OUT * state_d,
         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1,   int64_t sq2, int64_t sq3,
         int64_t sv1,   int64_t sv2, int64_t sv3,
@@ -169,27 +191,27 @@ static void launch_gated_delta_net(
 
     switch (S_v) {
         case 16:
-            gated_delta_net_cuda<16, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+            gated_delta_net_cuda<16, KDA, ST_IN, ST_OUT><<<grid_dims, block_dims, 0, stream>>>(
+                q_d, k_d, v_d, g_d, b_d, s_d, attn_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
         case 32:
-            gated_delta_net_cuda<32, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+            gated_delta_net_cuda<32, KDA, ST_IN, ST_OUT><<<grid_dims, block_dims, 0, stream>>>(
+                q_d, k_d, v_d, g_d, b_d, s_d, attn_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
         case 64: {
-            gated_delta_net_cuda<64, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+            gated_delta_net_cuda<64, KDA, ST_IN, ST_OUT><<<grid_dims, block_dims, 0, stream>>>(
+                q_d, k_d, v_d, g_d, b_d, s_d, attn_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
         }
         case 128: {
-            gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+            gated_delta_net_cuda<128, KDA, ST_IN, ST_OUT><<<grid_dims, block_dims, 0, stream>>>(
+                q_d, k_d, v_d, g_d, b_d, s_d, attn_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
             break;
@@ -201,12 +223,13 @@ static void launch_gated_delta_net(
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_tensor * src_q     = dst->src[0];
-    ggml_tensor * src_k     = dst->src[1];
-    ggml_tensor * src_v     = dst->src[2];
-    ggml_tensor * src_g     = dst->src[3];
-    ggml_tensor * src_beta  = dst->src[4];
-    ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_q         = dst->src[0];
+    ggml_tensor * src_k         = dst->src[1];
+    ggml_tensor * src_v         = dst->src[2];
+    ggml_tensor * src_g         = dst->src[3];
+    ggml_tensor * src_beta      = dst->src[4];
+    ggml_tensor * src_state     = dst->src[5];
+    ggml_tensor * src_writeback = dst->src[6]; // optional: write new state here instead of dst+offset
 
     GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
     GGML_TENSOR_LOCALS(size_t , nbq, src_q, nb);
@@ -234,9 +257,6 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     const float * g_d = (const float *) src_g->data;
     const float * b_d = (const float *) src_beta->data;
 
-    const float * s_d   = (const float *) src_state->data;
-    float *       dst_d = (float *) dst->data;
-
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
@@ -245,6 +265,13 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
+    GGML_ASSERT(src_state->type == GGML_TYPE_F32 || src_state->type == GGML_TYPE_F16);
+    if (src_writeback) {
+        GGML_ASSERT(src_writeback->type == GGML_TYPE_F32 || src_writeback->type == GGML_TYPE_F16);
+    }
+    // The legacy concat layout writes the new state into the F32 dst tail — F16 writeback
+    // is only meaningful on the fused path (where the storage slot is the writeback tensor).
+    GGML_ASSERT(src_writeback != nullptr || src_state->type == GGML_TYPE_F32);
 
     // strides in floats (beta strides used for both g and beta offset computation)
     const int64_t sq1 = nbq1 / sizeof(float);
@@ -261,13 +288,40 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     cudaStream_t stream = ctx.stream();
 
-    if (kda) {
-        launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+    // attn_out lives at the head of dst (always F32). State writeback target is either
+    // the dedicated src_writeback tensor (fused path — F32 or F16, matches storage slot)
+    // or the F32 dst tail (legacy concat).
+    float * attn_d = (float *) dst->data;
+
+    const ggml_type in_t  = src_state->type;
+    const ggml_type out_t = src_writeback ? src_writeback->type : GGML_TYPE_F32;
+
+    // Macro: (in, out) -> (ST_IN, ST_OUT) instantiation
+    #define LAUNCH_GDN(IN_T, OUT_T) do {                                                                 \
+        const IN_T * s_d_typed     = (const IN_T *) src_state->data;                                     \
+        OUT_T *      state_d_typed = src_writeback                                                       \
+            ? (OUT_T *) src_writeback->data                                                              \
+            : (OUT_T *) (attn_d + S_v * H * n_tokens * n_seqs);                                          \
+        if (kda) {                                                                                       \
+            launch_gated_delta_net<true,  IN_T, OUT_T>(q_d, k_d, v_d, g_d, b_d, s_d_typed, attn_d,       \
+                state_d_typed, S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                   \
+                sb1, sb2, sb3, neqk1, rq3, scale, stream);                                               \
+        } else {                                                                                         \
+            launch_gated_delta_net<false, IN_T, OUT_T>(q_d, k_d, v_d, g_d, b_d, s_d_typed, attn_d,       \
+                state_d_typed, S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                   \
+                sb1, sb2, sb3, neqk1, rq3, scale, stream);                                               \
+        }                                                                                                \
+    } while (0)
+
+    if (in_t == GGML_TYPE_F32 && out_t == GGML_TYPE_F32) {
+        LAUNCH_GDN(float, float);
+    } else if (in_t == GGML_TYPE_F32 && out_t == GGML_TYPE_F16) {
+        LAUNCH_GDN(float, half);
+    } else if (in_t == GGML_TYPE_F16 && out_t == GGML_TYPE_F16) {
+        LAUNCH_GDN(half, half);
     } else {
-        launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+        GGML_ABORT("gated_delta_net: unsupported (state %s, writeback %s) combo",
+                   ggml_type_name(in_t), ggml_type_name(out_t));
     }
+    #undef LAUNCH_GDN
 }

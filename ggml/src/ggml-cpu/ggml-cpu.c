@@ -2986,7 +2986,9 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
-                        cur = S_v * sizeof(float) * n_tasks;
+                        // delta(S_v) + per-thread F32 working-state scratch (S_v * S_v) used when
+                        // recurrent state buffer is stored as F16 (compute always happens in F32).
+                        cur = (S_v + S_v*S_v) * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_TURBO_WHT:
                     {

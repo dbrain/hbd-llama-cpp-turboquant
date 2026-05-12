@@ -41,6 +41,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
+    // The chunking SGEMM path runs the matmuls in F32. If the recurrent state buffer is
+    // stored as F16 (LLAMA_GDN_STATE_F16), promote on entry — F16 storage only buys us
+    // perf on the fused kernel; the cast cost lands on a rarely-taken fallback path.
+    if (s->type != GGML_TYPE_F32) {
+        s = ggml_cast(ctx0, s, GGML_TYPE_F32);
+    }
+
     const float scale = 1.0f / sqrtf(S_k);
 
     q = ggml_scale(ctx0, q, scale);
@@ -315,6 +322,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
+    if (s->type != GGML_TYPE_F32) {
+        s = ggml_cast(ctx0, s, GGML_TYPE_F32);
+    }
+
     const float scale = 1.0f / sqrtf(S_k);
 
     q = ggml_scale(ctx0, q, scale);
@@ -376,6 +387,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
+        ggml_tensor * state_writeback,
         int           il) {
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
@@ -397,7 +409,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
+    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, state_writeback);
     if (n_tokens == 1) {
         cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
     } else {
@@ -409,6 +421,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(result->type, S_v),
             ggml_row_size(result->type, S_v * H_v),
             ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
+
+    if (state_writeback) {
+        // new_state was written directly to state_writeback as a side effect — return it.
+        return {output, state_writeback};
+    }
 
     ggml_tensor * new_state = ggml_view_4d(ctx0, result,
             S_v, S_v, H_v, n_seqs,
@@ -427,18 +444,19 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
+        ggml_tensor * state_writeback,
         int           il) {
     const int64_t n_seq_tokens = q->ne[2];
 
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
-            return build_delta_net_fused(q, k, v, g, b, s, il);
+            return build_delta_net_fused(q, k, v, g, b, s, state_writeback, il);
         }
         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
     }
 
     if (cparams.fused_gdn_ch) {
-        return build_delta_net_fused(q, k, v, g, b, s, il);
+        return build_delta_net_fused(q, k, v, g, b, s, state_writeback, il);
     }
 
     return build_delta_net_chunking(q, k, v, g, b, s, il);

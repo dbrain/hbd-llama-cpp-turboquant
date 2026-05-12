@@ -15901,6 +15901,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
+                // src[6] (writeback) not yet supported on this backend — fall back to a backend that does.
+                if (op->src[6] != nullptr) {
+                    return false;
+                }
                 return op->type == GGML_TYPE_F32;
             }
         case GGML_OP_SSM_SCAN:

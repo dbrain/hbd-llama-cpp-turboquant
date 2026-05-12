@@ -168,19 +168,25 @@ llm_build_kimi_linear::llm_build_kimi_linear(const llama_model & model, const ll
             Qcur = ggml_l2_norm(ctx0, Qcur, eps_norm);
             Kcur = ggml_l2_norm(ctx0, Kcur, eps_norm);
 
-            // Choose between build_delta_net_chunking and build_delta_net_recurrent based on n_tokens
-            auto attn_out = build_delta_net(Qcur, Kcur, Vcur, g1, beta, state, il);
+            // Fused state writeback (see qwen35.cpp for explanation).
+            ggml_tensor * state_writeback =
+                ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
+                             kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+
+            const bool use_fused_gdn = (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
+
+            auto attn_out = build_delta_net(Qcur, Kcur, Vcur, g1, beta, state,
+                                             use_fused_gdn ? state_writeback : nullptr,
+                                             il);
 
             ggml_tensor * output = ggml_cont(ctx0, attn_out.first);
             ggml_tensor * new_state = attn_out.second;
             cb(output, "attn_output", il);
             cb(new_state, "new_state", il);
 
-            // Update the recurrent states
-            ggml_build_forward_expand(gf,
-                                     ggml_cpy(ctx0, new_state,
-                                              ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
-                                                           kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+            if (!use_fused_gdn) {
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state, state_writeback));
+            }
 
             // Output gating g2 = g_b(g_a(x))
             ggml_tensor * cur_2d = ggml_reshape_2d(ctx0, cur, cur->ne[0], n_seq_tokens * n_seqs);

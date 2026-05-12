@@ -5009,8 +5009,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
         case GGML_OP_GATED_LINEAR_ATTN:
-        case GGML_OP_GATED_DELTA_NET:
             return true;
+        case GGML_OP_GATED_DELTA_NET:
+            // src[6] (writeback) and F16 src[5] (state) not yet supported on this backend — fall back.
+            return op->src[6] == nullptr && op->src[5]->type == GGML_TYPE_F32;
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
