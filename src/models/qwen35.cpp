@@ -498,6 +498,17 @@ void llm_build_qwen35::build_mtp_head(
             cur = ggml_add(ctx0, cur, attn_residual);
         }
 
+        // Consumer reads only the last position's MTP logits (llama-context.cpp,
+        // offset = (mtp_n_tokens-1)*mtp_n_vocab). Attention above already wrote
+        // MTP KV for every position, so the rest (norms, FFN, lm_head) is
+        // per-position dead work for [0..n_tokens-2]. Slice to last column.
+        if (n_tokens > 1) {
+            cur = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1],
+                               (n_tokens - 1) * cur->nb[1]);
+            cur = ggml_cont(ctx0, cur);
+            cb(cur, "mtp_last_pos", il);
+        }
+
         // Step 5: Post-attention norm + FFN
         {
             ggml_tensor * ffn_residual = cur;
