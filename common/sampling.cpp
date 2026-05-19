@@ -263,8 +263,20 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     // Feed generation prompt tokens to the grammar sampler so it advances past
     // tokens the template already placed in the prompt.
     // Only applies to output-format and tool-call grammars; user-supplied grammars must not be prefilled.
+    //
+    // The reasoning-budget sampler also needs prefill_tokens to detect when
+    // the chat template put the model *inside* the thinking block (e.g.
+    // Qwen3-style templates that end with `<think>\n` in the assistant
+    // prefix). Without prefill, the sampler stays IDLE waiting for a start
+    // token that the model will never emit, the budget never arms, and the
+    // think block runs to max_tokens.
     std::vector<llama_token> prefill_tokens;
-    if (!params.generation_prompt.empty() && common_grammar_needs_prefill(params.grammar)) {
+    const bool grammar_needs_prefill = common_grammar_needs_prefill(params.grammar);
+    const bool rbudget_active =
+        !params.reasoning_budget_start.empty() &&
+        !params.reasoning_budget_end.empty() &&
+        (params.grammar_lazy || params.reasoning_budget_tokens >= 0);
+    if (!params.generation_prompt.empty() && (grammar_needs_prefill || rbudget_active)) {
         GGML_ASSERT(vocab != nullptr);
         prefill_tokens = common_tokenize(vocab, params.generation_prompt, false, true);
         if (!prefill_tokens.empty()) {
@@ -275,7 +287,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             }
         }
 
-        if (grmr && !params.grammar_lazy) {
+        if (grmr && !params.grammar_lazy && grammar_needs_prefill) {
             try {
                 for (const auto & token : prefill_tokens) {
                     llama_sampler_accept(grmr, token);
@@ -290,7 +302,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     }
 
     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
-    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0)) {
+    if (rbudget_active) {
         rbudget = common_reasoning_budget_init(
             vocab,
             params.reasoning_budget_start,
