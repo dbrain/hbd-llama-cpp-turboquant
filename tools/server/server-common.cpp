@@ -1110,11 +1110,15 @@ json oaicompat_chat_params_parse(
         llama_params["chat_parser"] = chat_params.parser;
     }
 
-    // Reasoning budget: pass parameters through to sampling layer
+    // Reasoning budget: pass parameters through to sampling layer.
+    // Body-level `thinking_budget_tokens` always wins when present so that
+    // callers can scope thinking per request (e.g. cheap classification: 256;
+    // deep review: 8192) without restarting the server. Falls back to the
+    // CLI flag (`--reasoning-budget`, default -1 = unlimited) otherwise.
     {
         int reasoning_budget = opt.reasoning_budget;
-        if (reasoning_budget == -1 && body.contains("thinking_budget_tokens")) {
-            reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
+        if (body.contains("thinking_budget_tokens")) {
+            reasoning_budget = json_value(body, "thinking_budget_tokens", reasoning_budget);
         }
 
         if (!chat_params.thinking_end_tag.empty()) {
