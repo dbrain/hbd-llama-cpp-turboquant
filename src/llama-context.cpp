@@ -177,6 +177,14 @@ llama_context::llama_context(
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
 
+    cparams.gdn_state_f16 = false;
+    if (const char * env = getenv("LLAMA_GDN_STATE_F16")) {
+        cparams.gdn_state_f16 = atoi(env) != 0;
+        if (cparams.gdn_state_f16) {
+            LLAMA_LOG_INFO("%s: GDN recurrent state buffer = F16 (LLAMA_GDN_STATE_F16=1)\n", __func__);
+        }
+    }
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 

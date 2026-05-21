@@ -37,6 +37,7 @@ struct llama_cparams {
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
+    bool gdn_state_f16;      // store GDN recurrent state buffer as F16 (halves the persistent state VRAM)
     bool no_perf;
     bool warmup;
     bool op_offload;
