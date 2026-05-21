@@ -858,6 +858,29 @@ private:
             cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             cparams_mtp.n_rs_seq = 0;
 
+            // The MTP draft context inherits the target's n_ubatch (512), so it reserves
+            // a full-vocab logits compute buffer sized to 512 positions — ~900 MiB of dead
+            // VRAM on Qwen3.5-9B — even though it only ever decodes n_max draft tokens per
+            // step. The compute buffer scales with n_ubatch (the physical chunk), so cap
+            // ONLY n_ubatch: n_batch stays wide enough to accept a full prompt in one
+            // logical batch (capping n_batch below the prompt length breaks prefill), while
+            // the prompt is processed in small physical chunks through the 1-layer MTP graph.
+            // Override with LLAMA_MTP_UBATCH (0 = inherit target, no cap).
+            //
+            // Default 128 is the knee of the prefill/VRAM curve (measured on a 28k-tok
+            // prompt, RTX 3060): saves ~740 MiB vs uncapped for only a ~1.5% prompt-prefill
+            // slowdown at max context (negligible on normal prompts). Decode t/s and draft
+            // acceptance are bit-identical at every ubatch — only large-prompt prefill is
+            // traded. Lower (e.g. 32) saves ~180 MiB more but costs ~9% prefill at 28k.
+            uint32_t mtp_ubatch = 128;
+            if (const char * env = getenv("LLAMA_MTP_UBATCH")) {
+                mtp_ubatch = (uint32_t) atoi(env);
+            }
+            if (mtp_ubatch > 0 && cparams_mtp.n_ubatch > mtp_ubatch) {
+                cparams_mtp.n_ubatch = mtp_ubatch;
+                SRV_INF("MTP draft context: capping n_ubatch to %u (LLAMA_MTP_UBATCH)\n", mtp_ubatch);
+            }
+
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {
                 SRV_ERR("%s", "failed to create MTP context\n");
