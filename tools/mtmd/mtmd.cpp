@@ -1336,15 +1336,45 @@ size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
     return image_tokens->ny;
 }
 
+// MTMD_VIDEO_TEMPORAL_STRIDE: when set (e.g. "2"), treat sequential images as
+// video frames. pos.t advances by the stride per image (frame index, matching
+// Qwen-VL training where each frame gets a small temporal increment) and
+// spatial pos.x/pos.y reset per frame to bare i%nx, i/nx (no pos_0 offset, so
+// frames share spatial coordinates as in training). Default behavior (unset)
+// matches upstream: pos.t = pos_0, pos.x/y carry pos_0 offset.
+static int _mtmd_video_temporal_stride() {
+    static int cached = -2; // -2: uncached, -1: disabled, >=1: enabled
+    if (cached == -2) {
+        const char * env = std::getenv("MTMD_VIDEO_TEMPORAL_STRIDE");
+        if (env && *env) {
+            int v = std::atoi(env);
+            cached = (v > 0) ? v : -1;
+        } else {
+            cached = -1;
+        }
+    }
+    return cached;
+}
+
 mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, llama_pos pos_0, size_t i) {
     mtmd_decoder_pos pos;
     switch (image_tokens->pos) {
         case MTMD_POS_TYPE_MROPE:
             {
-                pos.t = pos_0;
-                pos.x = pos_0 + (i % image_tokens->nx);
-                pos.y = pos_0 + (i / image_tokens->nx);
-                pos.z = 0; // unused for now
+                if (_mtmd_video_temporal_stride() > 0) {
+                    // video mode: pos.t carries per-frame temporal index (advanced by stride
+                    // per image via the patched _get_n_pos); spatial channels are bare offsets
+                    // within the frame so consecutive frames share spatial coords.
+                    pos.t = pos_0;
+                    pos.x = i % image_tokens->nx;
+                    pos.y = i / image_tokens->nx;
+                    pos.z = 0;
+                } else {
+                    pos.t = pos_0;
+                    pos.x = pos_0 + (i % image_tokens->nx);
+                    pos.y = pos_0 + (i / image_tokens->nx);
+                    pos.z = 0; // unused for now
+                }
             } break;
         case MTMD_POS_TYPE_NORMAL:
             {
@@ -1398,7 +1428,14 @@ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
 llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
     switch (image_tokens->pos) {
         case MTMD_POS_TYPE_MROPE:
-            return std::max(image_tokens->nx, image_tokens->ny);
+            {
+                int stride = _mtmd_video_temporal_stride();
+                if (stride > 0) {
+                    // video mode: advance pos_0 by per-frame temporal stride only
+                    return stride;
+                }
+                return std::max(image_tokens->nx, image_tokens->ny);
+            }
         case MTMD_POS_TYPE_NORMAL:
             return image_tokens->n_tokens();
         case MTMD_POS_TYPE_HUNYUANVL:

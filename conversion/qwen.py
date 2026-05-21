@@ -618,7 +618,7 @@ class _Qwen35MtpMixin:
         yield from super().modify_tensors(data_torch, name, bid)  # ty: ignore[unresolved-attribute]
 
 
-@ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
+@ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM", "MarlinForConditionalGeneration")
 class Qwen3_5TextModel(_Qwen35MtpMixin, _Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
 
