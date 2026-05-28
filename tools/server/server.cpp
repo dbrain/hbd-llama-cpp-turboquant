@@ -1,8 +1,10 @@
+#include "server-common.h"
 #include "server-context.h"
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-tools.h"
+#include "worker_isolation.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -13,7 +15,9 @@
 
 #include <atomic>
 #include <clocale>
+#include <cstdlib>
 #include <exception>
+#include <memory>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
@@ -86,13 +90,30 @@ int llama_server(int argc, char ** argv) {
         return 1;
     }
 
+    // worker-isolation parent mode: opt-in via LLAMA_WORKER_ISOLATION=1.
+    // Parent stays CUDA-free, owns the HTTP port, fork+execv's a child
+    // on a private port that owns the model + GPU. SIGKILLing the child
+    // via POST /v1/admin/unload reclaims ALL VRAM (primary CUDA context
+    // teardown). The child sees LLAMA_WORKER_ISOLATION_CHILD=1 and runs
+    // as a normal single-process llama-server. See worker_isolation.h.
+    auto getenv_truthy = [](const char * name) {
+        const char * v = std::getenv(name);
+        return v && v[0] && v[0] != '0';
+    };
+    const bool worker_iso_parent =
+        getenv_truthy("LLAMA_WORKER_ISOLATION") &&
+        !getenv_truthy("LLAMA_WORKER_ISOLATION_CHILD");
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
     // router server never loads a model and must not touch the GPU
     // skip device enumeration so the CUDA primary context stays uncreated
     const bool is_router_server = params.model.path.empty();
-    common_params_print_info(params, !is_router_server);
+    // worker-isolation parent is router-like: doesn't load a model in
+    // this process, holds the inbound port + proxies to a forked child.
+    const bool is_parent_only = is_router_server || worker_iso_parent;
+    common_params_print_info(params, !is_parent_only);
 
     // validate batch size for embeddings
     // embeddings require all tokens to be processed in a single ubatch
@@ -131,6 +152,78 @@ int llama_server(int argc, char ** argv) {
     // register API routes
     server_routes routes(params, ctx_server);
     server_tools tools;
+
+    // worker-isolation parent state. Spawns child lazily on first
+    // chat/completion/embedding request via routes overrides below.
+    std::unique_ptr<worker_isolation> worker_iso;
+    if (worker_iso_parent) {
+        SRV_INF("%s", "worker-isolation: parent mode active (LLAMA_WORKER_ISOLATION=1)\n");
+        SRV_INF("%s", "  parent stays CUDA-free, child holds model + GPU\n");
+        SRV_INF("%s", "  POST /v1/admin/unload SIGKILLs child → all VRAM reclaimed\n");
+        worker_iso = std::make_unique<worker_isolation>(params, argc, argv);
+
+        // Replace all model-facing handlers with proxies through the
+        // child subprocess. Drain check is done inside each lambda so
+        // streaming responses already in flight aren't aborted.
+        auto wi = worker_iso.get();
+        auto proxy_post_with_drain = [wi](const server_http_req & req) -> server_http_res_ptr {
+            if (wi->is_draining()) {
+                auto res = std::make_unique<server_http_res>();
+                res->status = 503;
+                res->data = safe_json_to_str({{"error", format_error_response(
+                    "service is draining; new requests rejected (admin/drain in effect)",
+                    ERROR_TYPE_UNAVAILABLE)}});
+                return res;
+            }
+            return wi->proxy(req, "POST");
+        };
+        auto proxy_post_no_drain = [wi](const server_http_req & req) -> server_http_res_ptr {
+            return wi->proxy_noflight(req, "POST");
+        };
+        auto proxy_get_no_drain  = [wi](const server_http_req & req) -> server_http_res_ptr {
+            return wi->proxy_noflight(req, "GET");
+        };
+
+        // Model-bearing endpoints: drain-gated + counted toward in_flight.
+        routes.post_completions            = proxy_post_with_drain;
+        routes.post_completions_oai        = proxy_post_with_drain;
+        routes.post_chat_completions       = proxy_post_with_drain;
+        routes.post_responses_oai          = proxy_post_with_drain;
+        routes.post_transcriptions_oai     = proxy_post_with_drain;
+        routes.post_anthropic_messages     = proxy_post_with_drain;
+        routes.post_anthropic_count_tokens = proxy_post_with_drain;
+        routes.post_infill                 = proxy_post_with_drain;
+        routes.post_embeddings             = proxy_post_with_drain;
+        routes.post_embeddings_oai         = proxy_post_with_drain;
+        routes.post_rerank                 = proxy_post_with_drain;
+        // Metadata + tokenize endpoints — proxy but don't gate (cheap,
+        // useful while draining; only fail when child is fully down).
+        routes.get_metrics                 = proxy_get_no_drain;
+        routes.get_slots                   = proxy_get_no_drain;
+        routes.post_slots                  = proxy_post_no_drain;
+        routes.get_props                   = proxy_get_no_drain;
+        routes.post_props                  = proxy_post_no_drain;
+        routes.get_models                  = proxy_get_no_drain;
+        routes.post_tokenize               = proxy_post_no_drain;
+        routes.post_detokenize             = proxy_post_no_drain;
+        routes.post_apply_template         = proxy_post_no_drain;
+        routes.get_lora_adapters           = proxy_get_no_drain;
+        routes.post_lora_adapters          = proxy_post_no_drain;
+        // /health stays parent-side and reports loaded/busy/draining/in_flight.
+        routes.get_health = [wi](const server_http_req &) -> server_http_res_ptr {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            json body = {
+                {"status",    "ok"},
+                {"loaded",    wi->is_loaded()},
+                {"busy",      wi->in_flight() > 0},
+                {"draining",  wi->is_draining()},
+                {"in_flight", wi->in_flight()},
+            };
+            res->data = safe_json_to_str(body);
+            return res;
+        };
+    }
 
     std::optional<server_models_routes> models_routes{};
     if (is_router_server) {
@@ -209,6 +302,69 @@ int llama_server(int argc, char ** argv) {
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
 
+    // worker-isolation admin endpoints — register only in parent mode.
+    // These match kob-gpu-gate's expected paths (see koblibs/kob-gpu-gate
+    // src/lib.rs::acquire_for_avatar — drain → wait → unload sequence).
+    if (worker_iso_parent) {
+        auto wi = worker_iso.get();
+        // POST /v1/admin/drain — block new requests; in-flight finish.
+        auto drain_handler = [wi](const server_http_req &) -> server_http_res_ptr {
+            wi->set_draining(true);
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->data = safe_json_to_str({
+                {"status",    "ok"},
+                {"draining",  true},
+                {"in_flight", wi->in_flight()},
+            });
+            return res;
+        };
+        // POST /v1/admin/unload — SIGKILL child, reclaim all VRAM.
+        // Also clears the draining flag so the next /v1/chat/completions
+        // request lazily re-spawns the child (avatar-release → llm-chat
+        // path; the kob-gpu-gate owner can still POST /v1/admin/load
+        // first if it wants a pre-warm).
+        auto unload_handler = [wi](const server_http_req &) -> server_http_res_ptr {
+            bool killed = wi->shutdown_child();
+            wi->set_draining(false);
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->data = safe_json_to_str({
+                {"status",  killed ? "ok" : "idle"},
+                {"loaded",  wi->is_loaded()},
+                {"unloaded", killed},
+            });
+            return res;
+        };
+        // POST /v1/admin/load — pre-warm + clear drain flag.
+        auto load_handler = [wi](const server_http_req &) -> server_http_res_ptr {
+            wi->set_draining(false);
+            bool was_loaded = wi->is_loaded();
+            bool ok = wi->ensure_loaded();
+            auto res = std::make_unique<server_http_res>();
+            if (!ok) {
+                res->status = 500;
+                res->data = safe_json_to_str({{"error", format_error_response(
+                    "failed to load worker child", ERROR_TYPE_SERVER)}});
+                return res;
+            }
+            res->status = 200;
+            res->data = safe_json_to_str({
+                {"status", "ok"},
+                {"loaded", wi->is_loaded()},
+                {"was_loaded", was_loaded},
+            });
+            return res;
+        };
+        ctx_http.post("/v1/admin/drain",  ex_wrapper(drain_handler));
+        ctx_http.post("/v1/admin/unload", ex_wrapper(unload_handler));
+        ctx_http.post("/v1/admin/load",   ex_wrapper(load_handler));
+        // legacy aliases without /v1 prefix (some clients use bare paths).
+        ctx_http.post("/admin/drain",     ex_wrapper(drain_handler));
+        ctx_http.post("/admin/unload",    ex_wrapper(unload_handler));
+        ctx_http.post("/admin/load",      ex_wrapper(load_handler));
+    }
+
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
 
@@ -263,6 +419,31 @@ int llama_server(int argc, char ** argv) {
         ctx_http.is_ready.store(true);
 
         shutdown_handler = [&](int) {
+            ctx_http.stop();
+        };
+
+    } else if (worker_iso_parent) {
+        SRV_INF("%s", "starting worker-isolation parent (no model loaded in this process)\n");
+        SRV_INF("%s", "  child will be spawned lazily on first model-bound request\n");
+
+        clean_up = [&ctx_http, &worker_iso]() {
+            SRV_INF("%s: cleaning up before exit...\n", __func__);
+            if (worker_iso) {
+                worker_iso->shutdown_child();
+            }
+            ctx_http.stop();
+            llama_backend_free();
+        };
+
+        if (!ctx_http.start()) {
+            clean_up();
+            SRV_ERR("%s", "exiting due to HTTP server error\n");
+            return 1;
+        }
+        ctx_http.is_ready.store(true);
+
+        shutdown_handler = [&](int) {
+            if (worker_iso) worker_iso->shutdown_child();
             ctx_http.stop();
         };
 
@@ -335,6 +516,12 @@ int llama_server(int argc, char ** argv) {
         }
 
         // when the HTTP server stops, clean up and exit
+        clean_up();
+    } else if (worker_iso_parent) {
+        SRV_INF("worker-isolation parent listening on %s\n", ctx_http.listening_address.c_str());
+        if (ctx_http.thread.joinable()) {
+            ctx_http.thread.join();
+        }
         clean_up();
     } else {
         SRV_INF("server is listening on %s\n", ctx_http.listening_address.c_str());
