@@ -566,7 +566,7 @@ static json parse_gcp_predict_response(const server_http_res_ptr & res) {
     }
 }
 
-void server_http_context::register_gcp_compat() {
+void server_http_context::register_gcp_compat() const {
     const gcp_params gcp;
 
     if (!gcp.enabled) {

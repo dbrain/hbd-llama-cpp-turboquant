@@ -594,7 +594,8 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
-    int32_t checkpoint_min_step = 256;   // minimum spacing between context checkpoints
+    int32_t checkpoint_every_nt = 8192;  // make a checkpoint every n tokens during prefill (turboquant; restored after upstream merge dropped it from common_params)
+    int32_t checkpoint_min_step = 256;   // minimum spacing between context checkpoints (upstream; currently unused by server-context.cpp)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
