@@ -84,8 +84,10 @@ public:
     // bumps in_flight_ for the lifetime of the returned response.
     server_http_res_ptr proxy(const server_http_req & req, const std::string & method);
 
-    // Same as proxy() but does NOT bump in_flight_ (use for non-chat
-    // endpoints like /v1/models / /props that we still want to forward).
+    // Same as proxy() but does NOT bump in_flight_ AND never lazily spawns the
+    // child (use for non-chat metadata endpoints like /v1/models / /props).
+    // Returns 503 when the child is down so a routine poll can't re-fork an
+    // intentionally-evicted worker back into VRAM.
     server_http_res_ptr proxy_noflight(const server_http_req & req, const std::string & method);
 
     // Child port (random ephemeral). 0 before first ensure_loaded.
@@ -93,6 +95,8 @@ public:
     int parent_port() const { return parent_port_; }
 
 private:
+    // Forward to the already-running child; never spawns. Returns 503 if down.
+    server_http_res_ptr forward_to_child(const server_http_req & req, const std::string & method);
     bool spawn_locked();  // caller holds spawn_mutex_
     bool wait_for_child_health_locked(int timeout_ms);
     void reap_locked();   // caller holds spawn_mutex_
