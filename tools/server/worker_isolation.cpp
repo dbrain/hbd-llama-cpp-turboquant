@@ -339,17 +339,16 @@ struct proxied_with_in_flight : server_http_res {
 
 } // namespace
 
-server_http_res_ptr worker_isolation::proxy_noflight(const server_http_req & req, const std::string & method) {
+// Forward to the already-running child. NEVER spawns — callers that want a
+// lazy cold-load must call ensure_loaded() first. Returns 503 when the child
+// is down so a metadata poll can't drag the model back into VRAM.
+server_http_res_ptr worker_isolation::forward_to_child(const server_http_req & req, const std::string & method) {
     int port = child_port_.load();
     if (port <= 0 || !loaded_.load()) {
-        // Try lazy-load.
-        if (!ensure_loaded()) {
-            auto res = std::make_unique<server_http_res>();
-            res->status = 503;
-            res->data = safe_json_to_str({{"error", format_error_response("worker child failed to start", ERROR_TYPE_UNAVAILABLE)}});
-            return res;
-        }
-        port = child_port_.load();
+        auto res = std::make_unique<server_http_res>();
+        res->status = 503;
+        res->data = safe_json_to_str({{"error", format_error_response("worker child not loaded", ERROR_TYPE_UNAVAILABLE)}});
+        return res;
     }
     std::string proxy_path = req.path;
     if (!req.query_string.empty()) proxy_path += '?' + req.query_string;
@@ -368,8 +367,27 @@ server_http_res_ptr worker_isolation::proxy_noflight(const server_http_req & req
     return proxy;
 }
 
+server_http_res_ptr worker_isolation::proxy_noflight(const server_http_req & req, const std::string & method) {
+    // Metadata / introspection endpoints (/v1/models, /props, /metrics,
+    // /slots, tokenize, …). These must NOT lazily spawn the child: an
+    // idle/evicted worker (e.g. while an Avatar/Flux render holds the GPU and
+    // kob-gpu-gate has unloaded the LLM) would be re-forked by a routine
+    // health/model-name poll, double-loading the model into VRAM on top of
+    // the render → OOM. Forward only when the child is already up; else 503.
+    return forward_to_child(req, method);
+}
+
 server_http_res_ptr worker_isolation::proxy(const server_http_req & req, const std::string & method) {
-    auto raw = proxy_noflight(req, method);
+    // Inference path: this is the only place allowed to lazily cold-load the
+    // child (the keep-warm "reload on next chat" contract). kob-gpu-gate gates
+    // these upstream so a chat can't reload the model mid-render.
+    if (!ensure_loaded()) {
+        auto res = std::make_unique<server_http_res>();
+        res->status = 503;
+        res->data = safe_json_to_str({{"error", format_error_response("worker child failed to start", ERROR_TYPE_UNAVAILABLE)}});
+        return res;
+    }
+    auto raw = forward_to_child(req, method);
     if (raw->status >= 500 && raw->data.find("worker child") != std::string::npos) {
         // Don't wrap an error response with an in-flight guard.
         return raw;
