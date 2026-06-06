@@ -9,6 +9,8 @@
 #include "build-info.h"
 #include "common.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API: llama_set_mtp_source
+#include "ggml-cpp.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -824,13 +826,23 @@ private:
 
             SRV_INF("loading draft model '%s'\n", params_spec.mparams.path.c_str());
 
+            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                            params_base.speculative.types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+
             auto params_dft = params_base;
 
             params_dft.devices      = params_spec.devices;
             params_dft.model        = params_spec.mparams;
             params_dft.n_gpu_layers = params_spec.n_gpu_layers;
-            params_dft.cache_type_k = params_spec.cache_type_k;
-            params_dft.cache_type_v = params_spec.cache_type_v;
+            // TODO: find a better way to expose that the cache is shared
+            if (spec_mtp) {
+                params_dft.cache_type_k = params_base.cache_type_k;
+                params_dft.cache_type_v = params_base.cache_type_v;
+            } else {
+                params_dft.cache_type_k = params_spec.cache_type_k;
+                params_dft.cache_type_v = params_spec.cache_type_v;
+            }
 
             if (params_spec.cpuparams.n_threads > 0) {
                 params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
@@ -849,9 +861,6 @@ private:
 
             auto cparams = common_context_params_to_llama(params_dft);
 
-            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                            params_base.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
             if (spec_mtp) {
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             }
@@ -860,6 +869,11 @@ private:
             //       the extra memory for small models is likely negligible?
             cparams.n_rs_seq = 0;
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+
+            if (spec_mtp) {
+                // MTP draft must know its target before the first decode
+                llama_set_mtp_source(ctx_dft.get(), ctx_tgt);
+            }
 
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
 
@@ -906,6 +920,10 @@ private:
                 SRV_ERR("%s", "failed to create MTP context\n");
                 return false;
             }
+
+            // wire the source before any decode (the seq-rm probe below
+            // triggers sched_reserve which needs src for Gemma4-style MTP)
+            llama_set_mtp_source(ctx_dft.get(), ctx_tgt);
 
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
 
