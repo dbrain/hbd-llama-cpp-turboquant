@@ -162,6 +162,15 @@ int llama_server(int argc, char ** argv) {
         SRV_INF("%s", "  POST /v1/admin/unload SIGKILLs child → all VRAM reclaimed\n");
         worker_iso = std::make_unique<worker_isolation>(params, argc, argv);
 
+        // Default GPU for the child: env WORKER_DEFAULT_GPU (a
+        // CUDA_VISIBLE_DEVICES value — index or "GPU-..." UUID). Empty →
+        // inherit the container CUDA_VISIBLE_DEVICES (backward compatible).
+        // Per-request override is the X-Worker-Gpu header (see worker_isolation).
+        if (const char * dg = std::getenv("WORKER_DEFAULT_GPU"); dg && dg[0]) {
+            worker_iso->set_default_gpu(dg);
+            SRV_INF("  WORKER_DEFAULT_GPU=%s (per-request override: X-Worker-Gpu header)\n", dg);
+        }
+
         // Replace all model-facing handlers with proxies through the
         // child subprocess. Drain check is done inside each lambda so
         // streaming responses already in flight aren't aborted.

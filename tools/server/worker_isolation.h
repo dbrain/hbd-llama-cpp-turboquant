@@ -51,10 +51,30 @@ public:
     worker_isolation(const common_params & params, int argc, char ** argv);
     ~worker_isolation();
 
+    // Default GPU (CUDA_VISIBLE_DEVICES value: index or "GPU-..." UUID) for
+    // the child when no per-request override is given. Empty = inherit the
+    // parent/container CUDA_VISIBLE_DEVICES (fully backward-compatible). The
+    // parent is CUDA-free so picking the device per-spawn is always safe; it
+    // lets kob-gpu-gate place / relocate the LLM across cards like the other
+    // kobbler inference servers. Sourced from env WORKER_DEFAULT_GPU.
+    void set_default_gpu(std::string gpu) { default_gpu_ = std::move(gpu); }
+    const std::string & default_gpu() const { return default_gpu_; }
+
+    // GPU the live child is currently pinned to (CUDA_VISIBLE_DEVICES value).
+    // Empty = inherited container env. Used to decide whether a request that
+    // targets a different card needs a relocation (kill + respawn).
+    const std::string & worker_gpu() const { return worker_gpu_; }
+
+    // Ensure the child is loaded on `want_gpu` (empty → default_gpu_). If a
+    // child is already resident on a *different* GPU, it is drained + killed +
+    // respawned on the target card (relocation). Returns true on success.
+    // Caller MUST hold no other lock when entering this.
+    bool ensure_loaded(const std::string & want_gpu);
+
     // Spawn child + poll its /health until ready (cold reload = ~5-10s).
     // Returns true on success. Caller MUST hold no other lock when
     // entering this — internally locks for the spawn duration.
-    bool ensure_loaded();
+    bool ensure_loaded() { return ensure_loaded(std::string()); }
 
     // SIGKILL the child + reap. Idempotent: returns false if already
     // idle, true if a live child was killed.
@@ -82,6 +102,13 @@ public:
     // streaming wrapper (server_http_proxy) or an error response. On
     // first call, lazily spawns the child + waits for readiness.
     // bumps in_flight_ for the lifetime of the returned response.
+    //
+    // The request's `X-Worker-Gpu: <GPU-UUID>` header (case-insensitive),
+    // when present + non-empty + different from where the child is resident,
+    // triggers a relocation: drain in-flight, kill the child, respawn it on
+    // the requested card BEFORE serving. Absent/empty header → keep the
+    // current/default card. This is how kob-gpu-gate places the LLM on a
+    // specific GPU per request without an OpenAI-incompatible body field.
     server_http_res_ptr proxy(const server_http_req & req, const std::string & method);
 
     // Same as proxy() but does NOT bump in_flight_ AND never lazily spawns the
@@ -97,9 +124,11 @@ public:
 private:
     // Forward to the already-running child; never spawns. Returns 503 if down.
     server_http_res_ptr forward_to_child(const server_http_req & req, const std::string & method);
-    bool spawn_locked();  // caller holds spawn_mutex_
+    bool spawn_locked();  // caller holds spawn_mutex_; spawns on want_gpu_
     bool wait_for_child_health_locked(int timeout_ms);
     void reap_locked();   // caller holds spawn_mutex_
+    // Resolve the X-Worker-Gpu header (case-insensitive) → target gpu string.
+    std::string resolve_target_gpu(const server_http_req & req) const;
 
     // captured at construction
     std::string argv0_;
@@ -119,4 +148,13 @@ private:
     std::atomic<bool> loaded_{false};
     std::atomic<bool> draining_{false};
     std::atomic<int>  in_flight_{0};
+
+    // GPU placement (CUDA_VISIBLE_DEVICES value: index or "GPU-..." UUID).
+    // default_gpu_  = card for un-targeted spawns (env WORKER_DEFAULT_GPU).
+    // want_gpu_     = card the *next* spawn_locked() should pin to (set by
+    //                 ensure_loaded() under spawn_mutex_ before spawning).
+    // worker_gpu_   = card the currently-resident child is pinned to.
+    std::string default_gpu_;
+    std::string want_gpu_;
+    std::string worker_gpu_;
 };

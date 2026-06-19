@@ -20,6 +20,7 @@
 #include <sheredom/subprocess.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -149,18 +150,36 @@ bool worker_isolation::is_loaded() const {
     return loaded_.load() && subproc_ != nullptr;
 }
 
-bool worker_isolation::ensure_loaded() {
-    if (loaded_.load() && subproc_ && subprocess_alive(subproc_.get())) {
+bool worker_isolation::ensure_loaded(const std::string & want_gpu) {
+    // Resolve the target card: explicit override, else the configured default.
+    // Empty → inherit the container CUDA_VISIBLE_DEVICES (legacy behaviour).
+    const std::string target = want_gpu.empty() ? default_gpu_ : want_gpu;
+
+    // Fast path: live child already on the right card.
+    if (loaded_.load() && subproc_ && subprocess_alive(subproc_.get()) &&
+        worker_gpu_ == target) {
         return true;
     }
     std::lock_guard<std::mutex> lk(spawn_mutex_);
-    if (loaded_.load() && subproc_ && subprocess_alive(subproc_.get())) {
+    if (loaded_.load() && subproc_ && subprocess_alive(subproc_.get()) &&
+        worker_gpu_ == target) {
         return true;
     }
-    // If child existed but died, reap it first.
-    if (subproc_ && !subprocess_alive(subproc_.get())) {
+    // Relocation: a live child on a different card must be killed + respawned
+    // on the target. Drain first so in-flight proxy streams aren't severed
+    // mid-response (handler-entry drain gate already 503's NEW requests; the
+    // request driving this relocation is itself pre-drain by contract — the
+    // gate sequences drain→wait→relocate upstream).
+    if (subproc_ && subprocess_alive(subproc_.get()) && worker_gpu_ != target) {
+        SRV_INF("worker-isolation: relocating child GPU '%s' -> '%s'\n",
+                worker_gpu_.empty() ? "(inherit)" : worker_gpu_.c_str(),
+                target.empty()      ? "(inherit)" : target.c_str());
+        reap_locked();
+    } else if (subproc_ && !subprocess_alive(subproc_.get())) {
+        // Child existed but died; reap before respawn.
         reap_locked();
     }
+    want_gpu_ = target;
     return spawn_locked();
 }
 
@@ -186,6 +205,7 @@ void worker_isolation::reap_locked() {
     subproc_.reset();
     child_port_.store(0);
     loaded_.store(false);
+    worker_gpu_.clear();
     // log_thread_ exits when fgets hits EOF, which subprocess_destroy
     // triggers by closing the read fd. Join here so the next spawn
     // doesn't race.
@@ -222,17 +242,28 @@ bool worker_isolation::spawn_locked() {
     // not implementing the Windows env-block path here; subprocess.h's
     // inherit-environment option suffices on Windows.
 #else
+    // When pinning to a specific card we override CUDA_VISIBLE_DEVICES in the
+    // child env (parent is CUDA-free, so its primary context lands on the
+    // requested device). Empty want_gpu_ → leave the inherited value untouched
+    // (fully backward compatible).
+    const bool pin_gpu = !want_gpu_.empty();
     if (environ) {
         for (char ** e = environ; *e; ++e) {
             std::string ev = *e;
             // Drop any prior LLAMA_WORKER_ISOLATION* — we set our own.
             if (ev.rfind("LLAMA_WORKER_ISOLATION", 0) == 0) continue;
+            // Drop inherited CUDA_VISIBLE_DEVICES when we're pinning — we
+            // re-add the targeted value below.
+            if (pin_gpu && ev.rfind("CUDA_VISIBLE_DEVICES=", 0) == 0) continue;
             env_owned.push_back(std::move(ev));
         }
     }
 #endif
     env_owned.emplace_back("LLAMA_WORKER_ISOLATION=0");
     env_owned.emplace_back("LLAMA_WORKER_ISOLATION_CHILD=1");
+    if (pin_gpu) {
+        env_owned.emplace_back("CUDA_VISIBLE_DEVICES=" + want_gpu_);
+    }
 
     std::vector<char *> envp;
     envp.reserve(env_owned.size() + 1);
@@ -286,7 +317,9 @@ bool worker_isolation::spawn_locked() {
     }
 
     loaded_.store(true);
-    SRV_INF("worker-isolation: child ready on 127.0.0.1:%d (pid alive)\n", port);
+    worker_gpu_ = want_gpu_;
+    SRV_INF("worker-isolation: child ready on 127.0.0.1:%d (pid alive) gpu=%s\n",
+            port, worker_gpu_.empty() ? "(inherit)" : worker_gpu_.c_str());
     return true;
 }
 
@@ -377,11 +410,37 @@ server_http_res_ptr worker_isolation::proxy_noflight(const server_http_req & req
     return forward_to_child(req, method);
 }
 
+std::string worker_isolation::resolve_target_gpu(const server_http_req & req) const {
+    // Case-insensitive lookup of "X-Worker-Gpu". httplib preserves the
+    // client's header casing, so we can't rely on a fixed key. Empty value
+    // (or absent header) → keep current/default card.
+    for (const auto & [k, v] : req.headers) {
+        if (k.size() != std::string("X-Worker-Gpu").size()) continue;
+        bool match = true;
+        const char * want = "x-worker-gpu";
+        for (size_t i = 0; i < k.size(); ++i) {
+            if (std::tolower((unsigned char) k[i]) != want[i]) { match = false; break; }
+        }
+        if (match) {
+            // trim surrounding whitespace
+            size_t a = v.find_first_not_of(" \t");
+            if (a == std::string::npos) return std::string();
+            size_t b = v.find_last_not_of(" \t");
+            return v.substr(a, b - a + 1);
+        }
+    }
+    return std::string();
+}
+
 server_http_res_ptr worker_isolation::proxy(const server_http_req & req, const std::string & method) {
     // Inference path: this is the only place allowed to lazily cold-load the
     // child (the keep-warm "reload on next chat" contract). kob-gpu-gate gates
     // these upstream so a chat can't reload the model mid-render.
-    if (!ensure_loaded()) {
+    //
+    // X-Worker-Gpu header (per-request override) places / relocates the child
+    // onto a specific card before serving. Empty/absent → default_gpu_.
+    const std::string target_gpu = resolve_target_gpu(req);
+    if (!ensure_loaded(target_gpu)) {
         auto res = std::make_unique<server_http_res>();
         res->status = 503;
         res->data = safe_json_to_str({{"error", format_error_response("worker child failed to start", ERROR_TYPE_UNAVAILABLE)}});
